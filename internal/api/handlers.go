@@ -379,3 +379,37 @@ func drainBody(r *http.Request) {
 	_, _ = io.Copy(io.Discard, r.Body)
 	_ = r.Body.Close()
 }
+
+// Doctor handles GET /doctor
+func (h *Handlers) Doctor(w http.ResponseWriter, r *http.Request) {
+	storeDir, lockHeld, authenticated, connected := h.manager.GetDiagnostics()
+	messageCount, chatCount, contactCount, groupCount, ftsEnabled, err := h.manager.GetDBStats()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "DIAGNOSTICS_FAILED")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, DoctorResponse{
+		StoreDir:      storeDir,
+		LockHeld:      lockHeld,
+		Authenticated: authenticated,
+		Connected:     connected,
+		FTSEnabled:    ftsEnabled,
+		MessageCount:  messageCount,
+		ChatCount:     chatCount,
+		ContactCount:  contactCount,
+		GroupCount:    groupCount,
+	})
+}
+
+// SyncStatus handles GET /sync/status
+func (h *Handlers) SyncStatus(w http.ResponseWriter, r *http.Request) {
+	running, state, startedAt := h.manager.SyncStatus()
+
+	writeJSON(w, http.StatusOK, SyncStatusResponse{
+		Running:        running,
+		State:          state,
+		MessagesSynced: 0, // TODO: track message count
+		StartedAt:      startedAt,
+	})
+}

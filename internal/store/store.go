@@ -526,6 +526,33 @@ func (d *DB) CountMessages() (int64, error) {
 	return n, nil
 }
 
+func (d *DB) CountChats() (int64, error) {
+	row := d.sql.QueryRow(`SELECT COUNT(1) FROM chats`)
+	var n int64
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func (d *DB) CountContacts() (int64, error) {
+	row := d.sql.QueryRow(`SELECT COUNT(1) FROM contacts`)
+	var n int64
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func (d *DB) CountGroups() (int64, error) {
+	row := d.sql.QueryRow(`SELECT COUNT(1) FROM groups`)
+	var n int64
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 func (d *DB) GetOldestMessageInfo(chatJID string) (MessageInfo, error) {
 	chatJID = strings.TrimSpace(chatJID)
 	if chatJID == "" {

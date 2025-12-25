@@ -210,48 +210,76 @@ func (m *Manager) InitiateAuth(ctx context.Context) error {
 	log.Println("[Manager] Starting authentication flow...")
 	m.state.SetState(StateConnecting)
 
+	// Channels to track auth completion
+	connected := make(chan struct{}, 1)
+	authFailed := make(chan error, 1)
+
 	// CRITICAL: Register event handler BEFORE Connect() so that pairing events are processed
-	// Without this, the key exchange during device linking won't work
-	pairSuccess := make(chan struct{}, 1)
+	// Without this, the key exchange during device linking won't work.
+	// The handler must stay active through the entire pairing process, not just until Connect() returns.
 	handlerID := m.app.WA().AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.PairSuccess:
 			log.Printf("[Manager] Pair success: %s", v.ID.String())
+		case *events.PairError:
+			log.Printf("[Manager] Pair error: %v", v.Error)
 			select {
-			case pairSuccess <- struct{}{}:
+			case authFailed <- fmt.Errorf("pairing failed: %v", v.Error):
 			default:
 			}
 		case *events.Connected:
 			log.Println("[Manager] WhatsApp connected event received")
+			select {
+			case connected <- struct{}{}:
+			default:
+			}
 		case *events.Disconnected:
 			log.Println("[Manager] WhatsApp disconnected during auth")
 		}
 	})
 
-	// Connect with QR code generation
+	// Connect with QR code generation - this blocks until QR flow completes
 	err := m.app.Connect(ctx, true, func(qr string) {
 		log.Printf("[Manager] QR code generated (length: %d)", len(qr))
 		m.state.SetQRCode(qr)
 	})
 
-	// Remove temp handler - sync worker will add its own
-	m.app.WA().RemoveEventHandler(handlerID)
-
 	if err != nil {
+		m.app.WA().RemoveEventHandler(handlerID)
 		log.Printf("[Manager] Authentication failed: %v", err)
 		m.state.SetError(err)
 		return err
 	}
 
-	// Wait a moment for pair success event
+	// Wait for Connected event with timeout - the encryption handshake may take a few seconds
+	// after Connect() returns. DO NOT remove the event handler until we confirm auth is complete.
 	select {
-	case <-pairSuccess:
-		log.Println("[Manager] Pair success confirmed")
-	case <-time.After(5 * time.Second):
-		log.Println("[Manager] Pair success event not received, continuing anyway")
+	case <-connected:
+		log.Println("[Manager] Authentication confirmed via Connected event")
+	case err := <-authFailed:
+		m.app.WA().RemoveEventHandler(handlerID)
+		log.Printf("[Manager] Authentication failed: %v", err)
+		m.state.SetError(err)
+		return err
+	case <-time.After(30 * time.Second):
+		// Timeout waiting for Connected event - check if actually authed anyway
+		if !m.app.WA().IsAuthed() {
+			err := fmt.Errorf("authentication timed out waiting for connection")
+			m.app.WA().RemoveEventHandler(handlerID)
+			log.Printf("[Manager] %v", err)
+			m.state.SetError(err)
+			return err
+		}
+		log.Println("[Manager] Auth appears complete despite no Connected event")
+	case <-ctx.Done():
+		m.app.WA().RemoveEventHandler(handlerID)
+		return ctx.Err()
 	}
 
-	// Verify authentication worked
+	// NOW it's safe to remove the temp handler - sync worker will add its own
+	m.app.WA().RemoveEventHandler(handlerID)
+
+	// Final verification that authentication worked
 	if !m.app.WA().IsAuthed() {
 		err := fmt.Errorf("authentication did not complete properly")
 		log.Printf("[Manager] %v", err)
@@ -519,4 +547,320 @@ func chatKind(chat types.JID) string {
 		return "dm"
 	}
 	return "unknown"
+}
+
+// --- Contact Methods ---
+
+// SearchContacts searches contacts in the local database.
+func (m *Manager) SearchContacts(query string, limit int) ([]store.Contact, error) {
+	a := m.App()
+	if a == nil {
+		return nil, fmt.Errorf("app not initialized")
+	}
+	return a.DB().SearchContacts(query, limit)
+}
+
+// GetContact returns a single contact from the local database.
+func (m *Manager) GetContact(jid string) (store.Contact, error) {
+	a := m.App()
+	if a == nil {
+		return store.Contact{}, fmt.Errorf("app not initialized")
+	}
+	return a.DB().GetContact(jid)
+}
+
+// RefreshContacts imports contacts from WhatsApp to the local database.
+func (m *Manager) RefreshContacts(ctx context.Context) (int, error) {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return 0, fmt.Errorf("app not initialized")
+	}
+
+	contacts, err := a.WA().GetAllContacts(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get contacts: %w", err)
+	}
+
+	count := 0
+	for jid, contact := range contacts {
+		err := a.DB().UpsertContact(jid.String(), jid.User, contact.PushName, contact.FullName, contact.FirstName, contact.BusinessName)
+		if err != nil {
+			log.Printf("[Manager] Failed to upsert contact %s: %v", jid.String(), err)
+			continue
+		}
+		count++
+	}
+
+	return count, nil
+}
+
+// SetContactAlias sets an alias for a contact.
+func (m *Manager) SetContactAlias(jid, alias string) error {
+	a := m.App()
+	if a == nil {
+		return fmt.Errorf("app not initialized")
+	}
+	return a.DB().SetAlias(jid, alias)
+}
+
+// RemoveContactAlias removes the alias from a contact.
+func (m *Manager) RemoveContactAlias(jid string) error {
+	a := m.App()
+	if a == nil {
+		return fmt.Errorf("app not initialized")
+	}
+	return a.DB().RemoveAlias(jid)
+}
+
+// AddContactTag adds a tag to a contact.
+func (m *Manager) AddContactTag(jid, tag string) error {
+	a := m.App()
+	if a == nil {
+		return fmt.Errorf("app not initialized")
+	}
+	return a.DB().AddTag(jid, tag)
+}
+
+// RemoveContactTag removes a tag from a contact.
+func (m *Manager) RemoveContactTag(jid, tag string) error {
+	a := m.App()
+	if a == nil {
+		return fmt.Errorf("app not initialized")
+	}
+	return a.DB().RemoveTag(jid, tag)
+}
+
+// --- Group Methods ---
+
+// ListGroups returns groups from the local database.
+func (m *Manager) ListGroups(query string, limit int) ([]store.Group, error) {
+	a := m.App()
+	if a == nil {
+		return nil, fmt.Errorf("app not initialized")
+	}
+	return a.DB().ListGroups(query, limit)
+}
+
+// GetGroupInfo fetches live group info from WhatsApp.
+func (m *Manager) GetGroupInfo(ctx context.Context, jidStr string) (*types.GroupInfo, error) {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return nil, fmt.Errorf("app not initialized")
+	}
+
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid JID: %w", err)
+	}
+
+	return a.WA().GetGroupInfo(ctx, jid)
+}
+
+// RefreshGroups imports joined groups from WhatsApp to the local database.
+func (m *Manager) RefreshGroups(ctx context.Context) (int, error) {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return 0, fmt.Errorf("app not initialized")
+	}
+
+	groups, err := a.WA().GetJoinedGroups(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get groups: %w", err)
+	}
+
+	count := 0
+	for _, g := range groups {
+		ownerJID := ""
+		if g.OwnerJID.User != "" {
+			ownerJID = g.OwnerJID.String()
+		}
+		err := a.DB().UpsertGroup(g.JID.String(), g.Name, ownerJID, g.GroupCreated)
+		if err != nil {
+			log.Printf("[Manager] Failed to upsert group %s: %v", g.JID.String(), err)
+			continue
+		}
+		count++
+	}
+
+	return count, nil
+}
+
+// RenameGroup changes the name of a group.
+func (m *Manager) RenameGroup(ctx context.Context, jidStr, name string) error {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return fmt.Errorf("app not initialized")
+	}
+
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return fmt.Errorf("invalid JID: %w", err)
+	}
+
+	return a.WA().SetGroupName(ctx, jid, name)
+}
+
+// UpdateGroupParticipants modifies group participants.
+func (m *Manager) UpdateGroupParticipants(ctx context.Context, groupJIDStr string, users []string, action string) ([]types.GroupParticipant, error) {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return nil, fmt.Errorf("app not initialized")
+	}
+
+	groupJID, err := types.ParseJID(groupJIDStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid group JID: %w", err)
+	}
+
+	var userJIDs []types.JID
+	for _, user := range users {
+		jid, err := wa.ParseUserOrJID(user)
+		if err != nil {
+			return nil, fmt.Errorf("invalid user %s: %w", user, err)
+		}
+		userJIDs = append(userJIDs, jid)
+	}
+
+	var waAction wa.GroupParticipantAction
+	switch action {
+	case "add":
+		waAction = wa.GroupParticipantAdd
+	case "remove":
+		waAction = wa.GroupParticipantRemove
+	case "promote":
+		waAction = wa.GroupParticipantPromote
+	case "demote":
+		waAction = wa.GroupParticipantDemote
+	default:
+		return nil, fmt.Errorf("invalid action: %s", action)
+	}
+
+	return a.WA().UpdateGroupParticipants(ctx, groupJID, userJIDs, waAction)
+}
+
+// GetGroupInviteLink returns the invite link for a group.
+func (m *Manager) GetGroupInviteLink(ctx context.Context, jidStr string) (string, error) {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return "", fmt.Errorf("app not initialized")
+	}
+
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return "", fmt.Errorf("invalid JID: %w", err)
+	}
+
+	return a.WA().GetGroupInviteLink(ctx, jid, false)
+}
+
+// RevokeGroupInviteLink revokes and returns a new invite link.
+func (m *Manager) RevokeGroupInviteLink(ctx context.Context, jidStr string) (string, error) {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return "", fmt.Errorf("app not initialized")
+	}
+
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return "", fmt.Errorf("invalid JID: %w", err)
+	}
+
+	return a.WA().GetGroupInviteLink(ctx, jid, true)
+}
+
+// JoinGroup joins a group using an invite code.
+func (m *Manager) JoinGroup(ctx context.Context, code string) (string, error) {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return "", fmt.Errorf("app not initialized")
+	}
+
+	jid, err := a.WA().JoinGroupWithLink(ctx, code)
+	if err != nil {
+		return "", err
+	}
+
+	return jid.String(), nil
+}
+
+// LeaveGroup leaves a group.
+func (m *Manager) LeaveGroup(ctx context.Context, jidStr string) error {
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return fmt.Errorf("app not initialized")
+	}
+
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return fmt.Errorf("invalid JID: %w", err)
+	}
+
+	return a.WA().LeaveGroup(ctx, jid)
+}
+
+// --- Sync Control Methods ---
+
+// SyncStatus returns the current sync worker status.
+func (m *Manager) SyncStatus() (running bool, state string, startedAt time.Time) {
+	m.mu.RLock()
+	running = m.syncRunning
+	m.mu.RUnlock()
+	state = string(m.state.State())
+	// Note: startedAt tracking could be added if needed
+	return
+}
+
+// IsSyncRunning returns whether the sync worker is running.
+func (m *Manager) IsSyncRunning() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.syncRunning
+}
+
+// --- Diagnostics ---
+
+// GetDiagnostics returns diagnostic information about the service.
+func (m *Manager) GetDiagnostics() (storeDir string, lockHeld bool, authenticated bool, connected bool) {
+	storeDir = m.config.DataDir
+	lockHeld = m.lock != nil
+
+	a := m.App()
+	if a != nil && a.WA() != nil {
+		authenticated = a.WA().IsAuthed()
+		connected = a.WA().IsConnected()
+	}
+
+	return
+}
+
+// GetDBStats returns database statistics.
+func (m *Manager) GetDBStats() (messageCount, chatCount, contactCount, groupCount int64, ftsEnabled bool, err error) {
+	a := m.App()
+	if a == nil {
+		err = fmt.Errorf("app not initialized")
+		return
+	}
+
+	messageCount, err = a.DB().CountMessages()
+	if err != nil {
+		return
+	}
+
+	chatCount, err = a.DB().CountChats()
+	if err != nil {
+		return
+	}
+
+	contactCount, err = a.DB().CountContacts()
+	if err != nil {
+		return
+	}
+
+	groupCount, err = a.DB().CountGroups()
+	if err != nil {
+		return
+	}
+
+	ftsEnabled = a.DB().HasFTS()
+	return
 }
