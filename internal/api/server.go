@@ -47,6 +47,7 @@ func NewServer(cfg service.Config, mgr *service.Manager) *Server {
 
 	// Message endpoints
 	mux.HandleFunc("/messages/text", methodHandler(http.MethodPost, handlers.SendText))
+	mux.HandleFunc("/messages/file", methodHandler(http.MethodPost, handlers.SendFile))
 
 	// Search endpoint
 	mux.HandleFunc("/search", methodHandler(http.MethodGet, handlers.Search))
@@ -56,7 +57,7 @@ func NewServer(cfg service.Config, mgr *service.Manager) *Server {
 	mux.HandleFunc("/chats/", chatMessagesHandler(handlers))
 
 	// Media endpoint
-	mux.HandleFunc("/media/", handlers.GetMedia)
+	mux.HandleFunc("/media/", mediaHandler(handlers))
 
 	// Stats endpoint
 	mux.HandleFunc("/stats", methodHandler(http.MethodGet, handlers.Stats))
@@ -74,6 +75,11 @@ func NewServer(cfg service.Config, mgr *service.Manager) *Server {
 
 	// Sync control endpoints
 	mux.HandleFunc("/sync/status", methodHandler(http.MethodGet, handlers.SyncStatus))
+	mux.HandleFunc("/sync/start", methodHandler(http.MethodPost, handlers.StartSync))
+	mux.HandleFunc("/sync/stop", methodHandler(http.MethodPost, handlers.StopSync))
+
+	// History backfill endpoint
+	mux.HandleFunc("/history/backfill", methodHandler(http.MethodPost, handlers.Backfill))
 
 	// Doctor/diagnostics endpoint
 	mux.HandleFunc("/doctor", methodHandler(http.MethodGet, handlers.Doctor))
@@ -274,6 +280,41 @@ func groupsHandler(h *Handlers) http.HandlerFunc {
 				return
 			}
 			h.LeaveGroup(w, r)
+			return
+		}
+
+		writeError(w, http.StatusNotFound, "endpoint not found", "NOT_FOUND")
+	}
+}
+
+// mediaHandler handles /media/{chat_jid}/{msg_id}/* routes.
+func mediaHandler(h *Handlers) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		path := strings.TrimPrefix(r.URL.Path, "/media/")
+		parts := strings.Split(path, "/")
+
+		// /media/{chat_jid}/{msg_id}/download
+		if len(parts) >= 3 && parts[2] == "download" {
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED")
+				return
+			}
+			h.DownloadMedia(w, r)
+			return
+		}
+
+		// /media/{chat_jid}/{msg_id} - GET media info or serve file
+		if len(parts) >= 2 {
+			if r.Method != http.MethodGet {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed", "METHOD_NOT_ALLOWED")
+				return
+			}
+			h.GetMedia(w, r)
 			return
 		}
 

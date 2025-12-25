@@ -2,9 +2,12 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -171,6 +174,65 @@ func (h *Handlers) SendText(w http.ResponseWriter, r *http.Request) {
 		Success:   true,
 		MessageID: msgID,
 		To:        req.To,
+	})
+}
+
+// SendFile handles POST /messages/file
+func (h *Handlers) SendFile(w http.ResponseWriter, r *http.Request) {
+	var req SendFileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body", "INVALID_REQUEST")
+		return
+	}
+
+	if strings.TrimSpace(req.To) == "" {
+		writeError(w, http.StatusBadRequest, "recipient 'to' is required", "MISSING_TO")
+		return
+	}
+
+	var data []byte
+	var err error
+	var filename string
+
+	if req.FileData != "" {
+		// Decode base64 data
+		data, err = decodeBase64(req.FileData)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid base64 file_data", "INVALID_FILE_DATA")
+			return
+		}
+		filename = req.Filename
+		if filename == "" {
+			filename = "file"
+		}
+	} else if req.FileURL != "" {
+		// Download from URL
+		data, filename, err = downloadFile(req.FileURL)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to download file: "+err.Error(), "DOWNLOAD_FAILED")
+			return
+		}
+		if req.Filename != "" {
+			filename = req.Filename
+		}
+	} else {
+		writeError(w, http.StatusBadRequest, "either file_data or file_url is required", "MISSING_FILE")
+		return
+	}
+
+	result, err := h.manager.SendFile(r.Context(), req.To, data, filename, req.Caption, req.MimeType)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "SEND_FAILED")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, SendFileResponse{
+		Success:   true,
+		MessageID: result.MessageID,
+		To:        req.To,
+		MediaType: result.MediaType,
+		Filename:  result.Filename,
+		MimeType:  result.MimeType,
 	})
 }
 
@@ -411,5 +473,141 @@ func (h *Handlers) SyncStatus(w http.ResponseWriter, r *http.Request) {
 		State:          state,
 		MessagesSynced: 0, // TODO: track message count
 		StartedAt:      startedAt,
+	})
+}
+
+// DownloadMedia handles POST /media/{chat_jid}/{msg_id}/download
+func (h *Handlers) DownloadMedia(w http.ResponseWriter, r *http.Request) {
+	// Extract chat JID and msg ID from path: /media/{chat_jid}/{msg_id}/download
+	path := strings.TrimPrefix(r.URL.Path, "/media/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 3 || parts[2] != "download" {
+		writeError(w, http.StatusBadRequest, "invalid path", "INVALID_PATH")
+		return
+	}
+	chatJID := parts[0]
+	msgID := parts[1]
+
+	result, err := h.manager.DownloadMedia(r.Context(), chatJID, msgID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, err.Error(), "NOT_FOUND")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error(), "DOWNLOAD_FAILED")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, DownloadMediaResponse{
+		Success:      true,
+		ChatJID:      result.ChatJID,
+		MsgID:        result.MsgID,
+		MediaType:    result.MediaType,
+		MimeType:     result.MimeType,
+		LocalPath:    result.LocalPath,
+		Bytes:        result.Bytes,
+		DownloadedAt: result.DownloadedAt,
+	})
+}
+
+// decodeBase64 decodes a base64 string, handling data URL prefixes.
+func decodeBase64(s string) ([]byte, error) {
+	// Strip data URL prefix if present (e.g., "data:image/png;base64,...")
+	if idx := strings.Index(s, ","); idx != -1 && strings.Contains(s[:idx], "base64") {
+		s = s[idx+1:]
+	}
+	return base64.StdEncoding.DecodeString(s)
+}
+
+// downloadFile downloads a file from a URL and returns its content and filename.
+func downloadFile(url string) ([]byte, string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Extract filename from URL path
+	filename := path.Base(url)
+	if filename == "" || filename == "." || filename == "/" {
+		filename = "file"
+	}
+
+	return data, filename, nil
+}
+
+// Backfill handles POST /history/backfill
+func (h *Handlers) Backfill(w http.ResponseWriter, r *http.Request) {
+	var req BackfillRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body", "INVALID_REQUEST")
+		return
+	}
+
+	if strings.TrimSpace(req.ChatJID) == "" {
+		writeError(w, http.StatusBadRequest, "chat_jid is required", "MISSING_CHAT_JID")
+		return
+	}
+
+	// Set defaults
+	count := req.Count
+	if count <= 0 {
+		count = 50
+	}
+	requests := req.Requests
+	if requests <= 0 {
+		requests = 1
+	}
+	waitSeconds := req.WaitPerRequestSeconds
+	if waitSeconds <= 0 {
+		waitSeconds = 60
+	}
+
+	result, err := h.manager.BackfillHistory(r.Context(), req.ChatJID, count, requests, waitSeconds)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "BACKFILL_FAILED")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, BackfillResponse{
+		Success: true,
+		JobID:   "", // Sync operation, no job ID
+		Status:  "completed",
+		Message: fmt.Sprintf("Added %d messages (%d requests sent)", result.MessagesAdded, result.RequestsSent),
+	})
+}
+
+// StartSync handles POST /sync/start
+func (h *Handlers) StartSync(w http.ResponseWriter, r *http.Request) {
+	if err := h.manager.StartSync(r.Context()); err != nil {
+		writeError(w, http.StatusConflict, err.Error(), "SYNC_START_FAILED")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "sync started",
+	})
+}
+
+// StopSync handles POST /sync/stop
+func (h *Handlers) StopSync(w http.ResponseWriter, r *http.Request) {
+	if err := h.manager.StopSync(); err != nil {
+		writeError(w, http.StatusConflict, err.Error(), "SYNC_STOP_FAILED")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "sync stopped",
 	})
 }

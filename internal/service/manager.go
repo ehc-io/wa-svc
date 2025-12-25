@@ -4,6 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"mime"
+	"net/http"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,8 +15,11 @@ import (
 	"github.com/steipete/wacli/internal/lock"
 	"github.com/steipete/wacli/internal/store"
 	"github.com/steipete/wacli/internal/wa"
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 // MessageHandler is called when a new message is received.
@@ -43,6 +50,8 @@ type Manager struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	syncRunning    bool
+	syncCtx        context.Context
+	syncCancel     context.CancelFunc
 	eventHandlerID uint32
 
 	messageHandlers []MessageHandler
@@ -304,6 +313,7 @@ func (m *Manager) startSyncWorker() {
 		return
 	}
 	m.syncRunning = true
+	m.syncCtx, m.syncCancel = context.WithCancel(m.ctx)
 	m.mu.Unlock()
 
 	go m.runSyncWorker()
@@ -336,7 +346,7 @@ func (m *Manager) runSyncWorker() {
 	})
 
 	// Keep the worker running until context is cancelled
-	<-m.ctx.Done()
+	<-m.syncCtx.Done()
 	log.Println("[Manager] Sync worker stopped")
 }
 
@@ -475,6 +485,96 @@ func (m *Manager) SendText(ctx context.Context, to, text string) (string, error)
 	return string(msgID), nil
 }
 
+// SendFileResult contains the result of sending a file.
+type SendFileResult struct {
+	MessageID string
+	MediaType string
+	Filename  string
+	MimeType  string
+}
+
+// SendFile sends a file/media to the specified recipient.
+func (m *Manager) SendFile(ctx context.Context, to string, data []byte, filename, caption, mimeType string) (*SendFileResult, error) {
+	if !m.state.State().IsReady() {
+		return nil, fmt.Errorf("service not ready (state: %s)", m.state.State())
+	}
+
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return nil, fmt.Errorf("WhatsApp client not available")
+	}
+
+	toJID, err := wa.ParseUserOrJID(to)
+	if err != nil {
+		return nil, fmt.Errorf("invalid recipient: %w", err)
+	}
+
+	// Detect mime type if not provided
+	if mimeType == "" {
+		mimeType = detectMimeType(filename, data)
+	}
+
+	// Determine media type and upload type
+	mediaType := "document"
+	uploadType, _ := wa.MediaTypeFromString("document")
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		mediaType = "image"
+		uploadType, _ = wa.MediaTypeFromString("image")
+	case strings.HasPrefix(mimeType, "video/"):
+		mediaType = "video"
+		uploadType, _ = wa.MediaTypeFromString("video")
+	case strings.HasPrefix(mimeType, "audio/"):
+		mediaType = "audio"
+		uploadType, _ = wa.MediaTypeFromString("audio")
+	}
+
+	// Upload the file
+	up, err := a.WA().Upload(ctx, data, uploadType)
+	if err != nil {
+		return nil, fmt.Errorf("upload failed: %w", err)
+	}
+
+	// Build the message
+	msg := buildMediaMessage(mediaType, mimeType, filename, caption, up)
+
+	// Send the message
+	msgID, err := a.WA().SendProtoMessage(ctx, toJID, msg)
+	if err != nil {
+		return nil, fmt.Errorf("send failed: %w", err)
+	}
+
+	// Store sent message
+	now := time.Now().UTC()
+	chatName := a.WA().ResolveChatName(ctx, toJID, "")
+	_ = a.DB().UpsertChat(toJID.String(), chatKind(toJID), chatName, now)
+	_ = a.DB().UpsertMessage(store.UpsertMessageParams{
+		ChatJID:       toJID.String(),
+		ChatName:      chatName,
+		MsgID:         msgID,
+		SenderName:    "me",
+		Timestamp:     now,
+		FromMe:        true,
+		Text:          caption,
+		MediaType:     mediaType,
+		MediaCaption:  caption,
+		Filename:      filename,
+		MimeType:      mimeType,
+		DirectPath:    up.DirectPath,
+		MediaKey:      up.MediaKey,
+		FileSHA256:    up.FileSHA256,
+		FileEncSHA256: up.FileEncSHA256,
+		FileLength:    up.FileLength,
+	})
+
+	return &SendFileResult{
+		MessageID: msgID,
+		MediaType: mediaType,
+		Filename:  filename,
+		MimeType:  mimeType,
+	}, nil
+}
+
 // SearchMessages searches messages in the database.
 func (m *Manager) SearchMessages(query string, limit int) ([]store.Message, error) {
 	a := m.App()
@@ -519,6 +619,78 @@ func (m *Manager) GetMediaDownloadInfo(chatJID, msgID string) (store.MediaDownlo
 	}
 
 	return a.DB().GetMediaDownloadInfo(chatJID, msgID)
+}
+
+// DownloadMediaResult contains the result of downloading media.
+type DownloadMediaResult struct {
+	ChatJID      string
+	MsgID        string
+	MediaType    string
+	MimeType     string
+	LocalPath    string
+	Bytes        int64
+	DownloadedAt time.Time
+}
+
+// DownloadMedia downloads media for a message and saves it to the store.
+func (m *Manager) DownloadMedia(ctx context.Context, chatJID, msgID string) (*DownloadMediaResult, error) {
+	if !m.state.State().IsReady() {
+		return nil, fmt.Errorf("service not ready (state: %s)", m.state.State())
+	}
+
+	a := m.App()
+	if a == nil || a.WA() == nil {
+		return nil, fmt.Errorf("app not initialized")
+	}
+
+	// Get media info from database
+	info, err := a.DB().GetMediaDownloadInfo(chatJID, msgID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get media info: %w", err)
+	}
+
+	if info.MediaType == "" || info.DirectPath == "" || len(info.MediaKey) == 0 {
+		return nil, fmt.Errorf("message has no downloadable media metadata")
+	}
+
+	// If already downloaded, return existing info
+	if info.LocalPath != "" {
+		return &DownloadMediaResult{
+			ChatJID:      info.ChatJID,
+			MsgID:        info.MsgID,
+			MediaType:    info.MediaType,
+			MimeType:     info.MimeType,
+			LocalPath:    info.LocalPath,
+			Bytes:        int64(info.FileLength),
+			DownloadedAt: info.DownloadedAt,
+		}, nil
+	}
+
+	// Resolve output path
+	targetPath, err := a.ResolveMediaOutputPath(info, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve output path: %w", err)
+	}
+
+	// Download the media
+	bytes, err := a.WA().DownloadMediaToFile(ctx, info.DirectPath, info.FileEncSHA256, info.FileSHA256, info.MediaKey, info.FileLength, info.MediaType, "", targetPath)
+	if err != nil {
+		return nil, fmt.Errorf("download failed: %w", err)
+	}
+
+	// Mark as downloaded in database
+	now := time.Now().UTC()
+	_ = a.DB().MarkMediaDownloaded(info.ChatJID, info.MsgID, targetPath, now)
+
+	return &DownloadMediaResult{
+		ChatJID:      info.ChatJID,
+		MsgID:        info.MsgID,
+		MediaType:    info.MediaType,
+		MimeType:     info.MimeType,
+		LocalPath:    targetPath,
+		Bytes:        bytes,
+		DownloadedAt: now,
+	}, nil
 }
 
 // Logout disconnects and clears the session.
@@ -863,4 +1035,146 @@ func (m *Manager) GetDBStats() (messageCount, chatCount, contactCount, groupCoun
 
 	ftsEnabled = a.DB().HasFTS()
 	return
+}
+
+// detectMimeType detects the MIME type from filename extension or content.
+func detectMimeType(filename string, data []byte) string {
+	// Try extension first
+	ext := strings.ToLower(filepath.Ext(filename))
+	if mimeType := mime.TypeByExtension(ext); mimeType != "" {
+		return mimeType
+	}
+
+	// Fall back to content sniffing
+	sniff := data
+	if len(sniff) > 512 {
+		sniff = sniff[:512]
+	}
+	return http.DetectContentType(sniff)
+}
+
+// buildMediaMessage builds a WhatsApp media message.
+func buildMediaMessage(mediaType, mimeType, filename, caption string, up whatsmeow.UploadResponse) *waProto.Message {
+	msg := &waProto.Message{}
+
+	switch mediaType {
+	case "image":
+		msg.ImageMessage = &waProto.ImageMessage{
+			URL:           proto.String(up.URL),
+			DirectPath:    proto.String(up.DirectPath),
+			MediaKey:      up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256,
+			FileSHA256:    up.FileSHA256,
+			FileLength:    proto.Uint64(up.FileLength),
+			Mimetype:      proto.String(mimeType),
+			Caption:       proto.String(caption),
+		}
+	case "video":
+		msg.VideoMessage = &waProto.VideoMessage{
+			URL:           proto.String(up.URL),
+			DirectPath:    proto.String(up.DirectPath),
+			MediaKey:      up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256,
+			FileSHA256:    up.FileSHA256,
+			FileLength:    proto.Uint64(up.FileLength),
+			Mimetype:      proto.String(mimeType),
+			Caption:       proto.String(caption),
+		}
+	case "audio":
+		msg.AudioMessage = &waProto.AudioMessage{
+			URL:           proto.String(up.URL),
+			DirectPath:    proto.String(up.DirectPath),
+			MediaKey:      up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256,
+			FileSHA256:    up.FileSHA256,
+			FileLength:    proto.Uint64(up.FileLength),
+			Mimetype:      proto.String(mimeType),
+			PTT:           proto.Bool(false),
+		}
+	default:
+		msg.DocumentMessage = &waProto.DocumentMessage{
+			URL:           proto.String(up.URL),
+			DirectPath:    proto.String(up.DirectPath),
+			MediaKey:      up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256,
+			FileSHA256:    up.FileSHA256,
+			FileLength:    proto.Uint64(up.FileLength),
+			Mimetype:      proto.String(mimeType),
+			FileName:      proto.String(filename),
+			Caption:       proto.String(caption),
+			Title:         proto.String(filename),
+		}
+	}
+
+	return msg
+}
+
+// BackfillResult represents the result of a history backfill operation.
+type BackfillResult struct {
+	ChatJID        string
+	RequestsSent   int
+	ResponsesSeen  int
+	MessagesAdded  int64
+	MessagesSynced int64
+}
+
+// BackfillHistory requests older messages for a chat from the primary device.
+func (m *Manager) BackfillHistory(ctx context.Context, chatJID string, count, requests, waitSeconds int) (*BackfillResult, error) {
+	a := m.App()
+	if a == nil {
+		return nil, fmt.Errorf("app not initialized")
+	}
+
+	waitDuration := time.Duration(waitSeconds) * time.Second
+	if waitDuration <= 0 {
+		waitDuration = 60 * time.Second
+	}
+
+	result, err := a.BackfillHistory(ctx, app.BackfillOptions{
+		ChatJID:        chatJID,
+		Count:          count,
+		Requests:       requests,
+		WaitPerRequest: waitDuration,
+		IdleExit:       5 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &BackfillResult{
+		ChatJID:        result.ChatJID,
+		RequestsSent:   result.RequestsSent,
+		ResponsesSeen:  result.ResponsesSeen,
+		MessagesAdded:  result.MessagesAdded,
+		MessagesSynced: result.MessagesSynced,
+	}, nil
+}
+
+// StartSync starts the sync worker if not already running.
+func (m *Manager) StartSync(ctx context.Context) error {
+	m.mu.Lock()
+	if m.syncRunning {
+		m.mu.Unlock()
+		return fmt.Errorf("sync is already running")
+	}
+	m.mu.Unlock()
+
+	// Start sync in a goroutine
+	go m.startSyncWorker()
+	return nil
+}
+
+// StopSync stops the sync worker if running.
+func (m *Manager) StopSync() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.syncRunning {
+		return fmt.Errorf("sync is not running")
+	}
+
+	if m.syncCancel != nil {
+		m.syncCancel()
+	}
+	return nil
 }
