@@ -1,0 +1,18 @@
+version: "3.8"
+
+# Development docker-compose with local volume mounting
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  wasvc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Mount local data directory for development
+      - ./data:/data
+    environment:
+      # Enable verbose logging in development
+      - WASVC_LOG_LEVEL=debug
+    ports:
+      - "8080:8080"

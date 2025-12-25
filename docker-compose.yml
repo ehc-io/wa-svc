@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+  wasvc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wasvc
+    restart: unless-stopped
+    ports:
+      - "${WASVC_PORT:-8080}:8080"
+    volumes:
+      # Persist WhatsApp session and message database
+      - wasvc_data:/data
+    environment:
+      # Server configuration
+      - WASVC_HOST=0.0.0.0
+      - WASVC_PORT=8080
+      - WASVC_DATA_DIR=/data
+
+      # API authentication (set in .env file or override)
+      - WASVC_API_KEY=${WASVC_API_KEY:-}
+
+      # Webhook configuration (optional)
+      - WASVC_WEBHOOK_URL=${WASVC_WEBHOOK_URL:-}
+      - WASVC_WEBHOOK_SECRET=${WASVC_WEBHOOK_SECRET:-}
+      - WASVC_WEBHOOK_RETRIES=${WASVC_WEBHOOK_RETRIES:-3}
+      - WASVC_WEBHOOK_TIMEOUT=${WASVC_WEBHOOK_TIMEOUT:-10s}
+
+      # Sync settings
+      - WASVC_DOWNLOAD_MEDIA=${WASVC_DOWNLOAD_MEDIA:-true}
+      - WASVC_REFRESH_CONTACTS=${WASVC_REFRESH_CONTACTS:-true}
+      - WASVC_REFRESH_GROUPS=${WASVC_REFRESH_GROUPS:-true}
+
+      # Graceful shutdown timeout
+      - WASVC_SHUTDOWN_TIMEOUT=${WASVC_SHUTDOWN_TIMEOUT:-30s}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  wasvc_data:
+    driver: local
