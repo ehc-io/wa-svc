@@ -28,7 +28,7 @@ A high-performance WhatsApp integration platform that bridges the WhatsApp Web M
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/wa-svc.git
+git clone https://github.com/ehc-io/wa-svc
 cd wa-svc
 
 # Build the binaries
@@ -162,6 +162,205 @@ The server starts at `http://localhost:8080` by default.
 
 # System diagnostics
 ./wacli doctor
+```
+
+## Practical Examples
+
+### Sending Text Messages
+
+**Via API:**
+```bash
+# Send a simple text message (use phone number without + or spaces)
+curl -X POST http://localhost:8080/messages/text \
+  -H "Authorization: Bearer your-secret-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "1234567890",
+    "message": "Hello from WhatsApp Service!"
+  }'
+
+# Response
+{
+  "success": true,
+  "msg_id": "3EB0C6C6F7F75F9C5B8E",
+  "timestamp": "2025-12-26T10:30:00Z"
+}
+```
+
+**Via CLI:**
+```bash
+# Send text message
+./wacli send text 1234567890 "Hello, World!"
+
+# Send to a group (use group JID)
+./wacli send text 123456789-1234567890@g.us "Hello group!"
+```
+
+### Sending Images and Files
+
+**Via API (multipart form):**
+```bash
+# Send an image with caption
+curl -X POST http://localhost:8080/messages/file \
+  -H "Authorization: Bearer your-secret-api-key" \
+  -F "to=1234567890" \
+  -F "file=@/path/to/photo.jpg" \
+  -F "caption=Check out this photo!"
+
+# Send a document
+curl -X POST http://localhost:8080/messages/file \
+  -H "Authorization: Bearer your-secret-api-key" \
+  -F "to=1234567890" \
+  -F "file=@/path/to/document.pdf" \
+  -F "caption=Here is the report"
+
+# Response
+{
+  "success": true,
+  "msg_id": "3EB0C6C6F7F75F9C5B8F",
+  "media_type": "image"
+}
+```
+
+**Via CLI:**
+```bash
+# Send an image
+./wacli send file 1234567890 photo.jpg --caption "Check this out!"
+
+# Send a video
+./wacli send file 1234567890 video.mp4 --caption "Watch this"
+
+# Send a document
+./wacli send file 1234567890 report.pdf
+```
+
+### Downloading Media
+
+**Step 1: Get media info from a message:**
+```bash
+# Get media metadata for a specific message
+curl http://localhost:8080/media/{chat_jid}/{msg_id} \
+  -H "Authorization: Bearer your-secret-api-key"
+
+# Response
+{
+  "msg_id": "3EB0C6C6F7F75F9C5B8E",
+  "media_type": "image",
+  "mimetype": "image/jpeg",
+  "file_size": 245678,
+  "filename": "photo.jpg",
+  "downloaded": false
+}
+```
+
+**Step 2: Download the media file:**
+```bash
+# Trigger download (saves to data/media/)
+curl -X POST http://localhost:8080/media/{chat_jid}/{msg_id}/download \
+  -H "Authorization: Bearer your-secret-api-key"
+
+# Response
+{
+  "success": true,
+  "local_path": "media/1234567890/3EB0C6C6F7F75F9C5B8E.jpg"
+}
+
+# Get the actual file (after download)
+curl http://localhost:8080/media/{chat_jid}/{msg_id}?download=true \
+  -H "Authorization: Bearer your-secret-api-key" \
+  -o downloaded_photo.jpg
+```
+
+### Looking Up Contacts and Sending Messages
+
+**Step 1: Search for a contact by name:**
+```bash
+# Search contacts by name
+curl "http://localhost:8080/contacts?q=john" \
+  -H "Authorization: Bearer your-secret-api-key"
+
+# Response
+{
+  "contacts": [
+    {
+      "jid": "1234567890@s.whatsapp.net",
+      "name": "John Smith",
+      "phone": "1234567890",
+      "alias": "Johnny"
+    },
+    {
+      "jid": "0987654321@s.whatsapp.net",
+      "name": "John Doe",
+      "phone": "0987654321"
+    }
+  ]
+}
+```
+
+**Step 2: Send a message to the found contact:**
+```bash
+# Use the phone number from the JID (without @s.whatsapp.net)
+curl -X POST http://localhost:8080/messages/text \
+  -H "Authorization: Bearer your-secret-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "1234567890",
+    "message": "Hey John, how are you?"
+  }'
+```
+
+**Complete workflow via CLI:**
+```bash
+# Search for contact
+./wacli contacts search john
+
+# Output:
+# JID                          Name         Phone
+# 1234567890@s.whatsapp.net    John Smith   1234567890
+# 0987654321@s.whatsapp.net    John Doe     0987654321
+
+# Send message using the phone number
+./wacli send text 1234567890 "Hey John!"
+```
+
+**Set a custom alias for easier lookup:**
+```bash
+# Set an alias for a contact
+curl -X PUT http://localhost:8080/contacts/1234567890@s.whatsapp.net/alias \
+  -H "Authorization: Bearer your-secret-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"alias": "Johnny"}'
+
+# Now search by alias
+curl "http://localhost:8080/contacts?q=johnny" \
+  -H "Authorization: Bearer your-secret-api-key"
+```
+
+### Searching Message History
+
+```bash
+# Full-text search across all messages
+curl "http://localhost:8080/search?q=meeting+tomorrow&limit=20" \
+  -H "Authorization: Bearer your-secret-api-key"
+
+# Response
+{
+  "results": [
+    {
+      "chat_jid": "1234567890@s.whatsapp.net",
+      "msg_id": "3EB0C6C6F7F75F9C5B8E",
+      "sender_name": "John Smith",
+      "text": "Let's have a meeting tomorrow at 10am",
+      "timestamp": "2025-12-25T15:30:00Z",
+      "snippet": "Let's have a <b>meeting</b> <b>tomorrow</b> at 10am"
+    }
+  ],
+  "total": 1
+}
+
+# Get all messages from a specific chat
+curl "http://localhost:8080/chats/1234567890@s.whatsapp.net/messages?limit=50" \
+  -H "Authorization: Bearer your-secret-api-key"
 ```
 
 ## Webhooks
