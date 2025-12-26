@@ -34,6 +34,9 @@ services:
 
       # Graceful shutdown timeout
       - WASVC_SHUTDOWN_TIMEOUT=${WASVC_SHUTDOWN_TIMEOUT:-30s}
+
+      # Debug logging (set to "true" or "1" to enable)
+      - WA_DEBUG=${WA_DEBUG:-false}
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
       interval: 30s

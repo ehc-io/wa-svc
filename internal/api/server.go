@@ -99,8 +99,8 @@ func NewServer(cfg service.Config, mgr *service.Manager) *Server {
 	server := &http.Server{
 		Addr:         cfg.Addr(),
 		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout:  5 * time.Minute,  // Increased for large file uploads
+		WriteTimeout: 5 * time.Minute,  // Increased for large file uploads
 		IdleTimeout:  120 * time.Second,
 	}
 

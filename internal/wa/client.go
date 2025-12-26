@@ -12,11 +12,20 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
+
+// debugLog prints debug messages when WA_DEBUG environment variable is set to "true" or "1"
+func debugLog(format string, args ...interface{}) {
+	if v := os.Getenv("WA_DEBUG"); v == "true" || v == "1" {
+		fmt.Printf(format, args...)
+	}
+}
 
 type Options struct {
 	StorePath  string
@@ -46,11 +55,15 @@ func (c *Client) init() error {
 	defer c.mu.Unlock()
 
 	// Set device properties for WhatsApp linked devices list
+	// PlatformType MUST be set to something other than UNKNOWN, otherwise WhatsApp shows "Other device"
+	// Using DESKTOP shows just the OS name without browser prefix (e.g., "WhatsApp-SVC" not "Chrome (WhatsApp-SVC)")
 	deviceName := c.opts.DeviceName
 	if deviceName == "" {
 		deviceName = "WhatsApp-SVC"
 	}
-	store.SetOSInfo(deviceName, [3]uint32{1, 0, 0})
+	store.DeviceProps.Os = proto.String(deviceName)
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+	store.DeviceProps.RequireFullSync = proto.Bool(false)
 
 	ctx := context.Background()
 	dbLog := waLog.Stdout("Database", "ERROR", true)
@@ -120,6 +133,11 @@ func (c *Client) Connect(ctx context.Context, opts ConnectOptions) error {
 		ch, _ := cli.GetQRChannel(ctx)
 		qrChan = ch
 	}
+
+	debugLog("[WA-DEBUG] DeviceProps before Connect:\n")
+	debugLog("[WA-DEBUG]   Os: %v\n", store.DeviceProps.GetOs())
+	debugLog("[WA-DEBUG]   PlatformType: %v\n", store.DeviceProps.GetPlatformType())
+	debugLog("[WA-DEBUG]   RequireFullSync: %v\n", store.DeviceProps.GetRequireFullSync())
 
 	if err := cli.ConnectContext(ctx); err != nil {
 		return err
