@@ -12,13 +12,15 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 type Options struct {
-	StorePath string
+	StorePath  string
+	DeviceName string // Name shown in WhatsApp linked devices (default: "WhatsApp-SVC")
 }
 
 type Client struct {
@@ -42,6 +44,13 @@ func New(opts Options) (*Client, error) {
 func (c *Client) init() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Set device properties for WhatsApp linked devices list
+	deviceName := c.opts.DeviceName
+	if deviceName == "" {
+		deviceName = "WhatsApp-SVC"
+	}
+	store.SetOSInfo(deviceName, [3]uint32{1, 0, 0})
 
 	ctx := context.Background()
 	dbLog := waLog.Stdout("Database", "ERROR", true)

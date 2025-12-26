@@ -329,6 +329,9 @@ func (m *Manager) runSyncWorker() {
 
 	log.Println("[Manager] Starting sync worker...")
 
+	// Channel to signal reconnection needed
+	reconnectCh := make(chan struct{}, 1)
+
 	// Register event handler for messages
 	m.eventHandlerID = m.app.WA().AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -340,10 +343,69 @@ func (m *Manager) runSyncWorker() {
 		case *events.Disconnected:
 			log.Println("[Manager] WhatsApp disconnected")
 			m.state.SetState(StateDisconnected)
+			// Signal reconnection needed
+			select {
+			case reconnectCh <- struct{}{}:
+			default:
+			}
 		case *events.HistorySync:
 			m.handleHistorySync(v)
 		}
 	})
+
+	// Auto-reconnect loop
+	go func() {
+		backoff := time.Second
+		maxBackoff := 2 * time.Minute
+
+		// Initial connection check - if not connected, trigger reconnect
+		if m.app.WA().IsAuthed() && !m.app.WA().IsConnected() {
+			select {
+			case reconnectCh <- struct{}{}:
+			default:
+			}
+		}
+
+		for {
+			select {
+			case <-m.syncCtx.Done():
+				return
+			case <-reconnectCh:
+				// Wait a moment before reconnecting
+				time.Sleep(backoff)
+
+				// Check if still authenticated
+				if !m.app.WA().IsAuthed() {
+					log.Println("[Manager] Not authenticated, cannot auto-reconnect")
+					continue
+				}
+
+				// Check if already connected
+				if m.app.WA().IsConnected() {
+					backoff = time.Second
+					continue
+				}
+
+				log.Printf("[Manager] Attempting to reconnect (backoff: %v)...", backoff)
+				if err := m.app.Connect(m.syncCtx, false, nil); err != nil {
+					log.Printf("[Manager] Reconnect failed: %v", err)
+					// Increase backoff
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					// Try again
+					select {
+					case reconnectCh <- struct{}{}:
+					default:
+					}
+				} else {
+					log.Println("[Manager] Reconnected successfully")
+					backoff = time.Second
+				}
+			}
+		}
+	}()
 
 	// Keep the worker running until context is cancelled
 	<-m.syncCtx.Done()
