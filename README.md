@@ -1,113 +1,62 @@
-# 🗃️ wacli — WhatsApp CLI: sync, search, send.
+### **Project README**
 
-WhatsApp CLI built on top of `whatsmeow`, focused on:
+# WhatsApp-SVC (wa-svc)
 
-- Best-effort local sync of message history + continuous capture
-- Fast offline search
-- Sending messages
-- Contact + group management
+`wa-svc` is a high-performance WhatsApp integration service that provides a bridge between the WhatsApp Web protocol and your applications via a REST API and CLI. It is designed for message archiving, automated notifications, and local message search.
 
-This is a third-party tool that uses the WhatsApp Web protocol via `whatsmeow` and is not affiliated with WhatsApp.
+## 🚀 Key Capabilities
 
-## Status
+*   **Continuous Synchronization**: Automatically captures and stores message history in a local SQLite database.
+*   **Custom Device Identity**: Registers as a distinct "Desktop" device named `WhatsApp-SVC` in your linked devices list.
+*   **Rich Media Support**: 
+    *   Send and receive images, documents, and files.
+    *   Automated metadata capture for reliable media downloading and decryption.
+*   **Powerful Search**: Built-in Full-Text Search (FTS5) with BM25 ranking for ultra-fast offline searching of your entire message history.
+*   **Flexible Interface**: 
+    *   **`wasvc`**: A RESTful HTTP API for server-side integrations.
+    *   **`wacli`**: A command-line tool for local management and testing.
+*   **Webhooks**: Real-time delivery of incoming messages and status updates to your external services.
 
-Core implementation is in place. See `docs/spec.md` for the full design notes.
+## 🛠 Tech Stack
 
-## Install / Build
+*   **Language**: Go 1.24+
+*   **Protocol**: [whatsmeow](https://github.com/tulir/whatsmeow) (WhatsApp Multi-Device)
+*   **Database**: SQLite3 with FTS5 Full-Text Search
+*   **Containerization**: Docker & Docker Compose
 
-Install via Homebrew (tap):
+## 🚦 Getting Started
 
-- `brew install steipete/tap/wacli`
-
-Build locally:
-
-- `go build -tags sqlite_fts5 -o ./dist/wacli ./cmd/wacli`
-
-Run:
-
-- `./dist/wacli --help`
-
-## Quick start
-
-Default store directory is `~/.wacli` (override with `--store DIR`).
-
+### 1. Environment Configuration
+Create a `.env` file based on `.env.example`:
 ```bash
-# 1) Authenticate (shows QR), then bootstrap sync
-pnpm wacli auth
-# or: ./dist/wacli auth (after pnpm build)
-
-# 2) Keep syncing (never shows QR; requires prior auth)
-pnpm wacli sync --follow
-
-# Diagnostics
-pnpm wacli doctor
-
-# Search messages
-pnpm wacli messages search "meeting"
-
-# Backfill older messages for a chat (best-effort; requires your primary device online)
-pnpm wacli history backfill --chat 1234567890@s.whatsapp.net --requests 10 --count 50
-
-# Download media for a message (after syncing)
-./wacli media download --chat 1234567890@s.whatsapp.net --id <message-id>
-
-# Send a message
-pnpm wacli send text --to 1234567890 --message "hello"
-
-# Send a file
-./wacli send file --to 1234567890 --file ./pic.jpg --caption "hi"
-
-# List groups and manage participants
-pnpm wacli groups list
-pnpm wacli groups rename --jid 123456789@g.us --name "New name"
+WA_DEBUG=false
+WASVC_HTTP_ADDR=0.0.0.0:8080
+WASVC_API_KEY=your_secure_key
 ```
 
-## Prior Art / Credit
-
-This project is heavily inspired by (and learns from) the excellent `whatsapp-cli` by Vicente Reig:
-
-- [`whatsapp-cli`](https://github.com/vicentereig/whatsapp-cli)
-
-## High-level UX
-
-- `wacli auth`: interactive login (shows QR code), then immediately performs initial data sync.
-- `wacli sync`: non-interactive sync loop (never shows QR; errors if not authenticated).
-- Output is human-readable by default; pass `--json` for machine-readable output.
-
-## Storage
-
-Defaults to `~/.wacli` (override with `--store DIR`).
-
-## Backfilling older history
-
-`wacli sync` stores whatever WhatsApp Web sends opportunistically. To try to fetch *older* messages, use on-demand history sync requests to your **primary device** (your phone).
-
-Important notes:
-
-- This is **best-effort**: WhatsApp may not return full history.
-- Your **primary device must be online**.
-- Requests are **per chat** (DM or group). `wacli` uses the *oldest locally stored message* in that chat as the anchor.
-- Recommended `--count` is `50` per request.
-
-### Backfill one chat
-
+### 2. Deployment
 ```bash
-pnpm wacli history backfill --chat 1234567890@s.whatsapp.net --requests 10 --count 50
+docker compose build
+docker compose up -d
 ```
 
-### Backfill all chats (script)
+### 3. Authentication
+1.  Initiate pairing: `POST /auth/init`
+2.  Retrieve the QR code: `GET /auth/qr` (or open the service URL in a browser for the Web UI).
+3.  Scan with your WhatsApp phone.
 
-This loops through chats already known in your local DB:
+## 📡 API Highlights
 
-```bash
-pnpm -s wacli -- --json chats list --limit 100000 \
-  | jq -r '.[].JID' \
-  | while read -r jid; do
-      pnpm -s wacli -- history backfill --chat "$jid" --requests 3 --count 50
-    done
-```
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `/messages/text` | `POST` | Send a plain text message |
+| `/messages/file` | `POST` | Send images or documents (base64) |
+| `/media/{jid}/{msg_id}/download` | `POST` | Trigger background media download |
+| `/search?q=...` | `GET` | Full-text search across all stored messages |
+| `/auth/status` | `GET` | Check connection and authentication state |
 
-## License
+## 🔧 Troubleshooting & Debugging
+Enable verbose logging for the WhatsApp protocol by setting the environment variable:
+`WA_DEBUG=true`
 
-See `LICENSE`.
-# wa-svc
+This will output detailed connection states and device property validation logs to the container output.

@@ -419,6 +419,12 @@ func (m *Manager) handleIncomingMessage(evt *events.Message) {
 		return
 	}
 
+	mediaInfo := ""
+	if pm.Media != nil {
+		mediaInfo = fmt.Sprintf(" [media:%s]", pm.Media.Type)
+	}
+	log.Printf("[Manager] Incoming message: chat=%s from=%s id=%s%s", pm.Chat.String(), pm.SenderJID, pm.ID, mediaInfo)
+
 	// Store the message
 	a := m.App()
 	if a == nil {
@@ -433,21 +439,39 @@ func (m *Manager) handleIncomingMessage(evt *events.Message) {
 	_ = a.DB().UpsertChat(pm.Chat.String(), chatKind(pm.Chat), chatName, pm.Timestamp)
 
 	var mediaType, caption string
+	var mediaKey, fileSHA256, fileEncSHA256 []byte
+	var directPath, mimeType, filename string
+	var fileLength uint64
 	if pm.Media != nil {
 		mediaType = pm.Media.Type
 		caption = pm.Media.Caption
+		filename = pm.Media.Filename
+		mimeType = pm.Media.MimeType
+		directPath = pm.Media.DirectPath
+		mediaKey = pm.Media.MediaKey
+		fileSHA256 = pm.Media.FileSHA256
+		fileEncSHA256 = pm.Media.FileEncSHA256
+		fileLength = pm.Media.FileLength
 	}
 
 	_ = a.DB().UpsertMessage(store.UpsertMessageParams{
-		ChatJID:    pm.Chat.String(),
-		ChatName:   chatName,
-		MsgID:      pm.ID,
-		SenderJID:  pm.SenderJID,
-		SenderName: pm.PushName,
-		Timestamp:  pm.Timestamp,
-		FromMe:     pm.FromMe,
-		Text:       pm.Text,
-		MediaType:  mediaType,
+		ChatJID:       pm.Chat.String(),
+		ChatName:      chatName,
+		MsgID:         pm.ID,
+		SenderJID:     pm.SenderJID,
+		SenderName:    pm.PushName,
+		Timestamp:     pm.Timestamp,
+		FromMe:        pm.FromMe,
+		Text:          pm.Text,
+		MediaType:     mediaType,
+		MediaCaption:  caption,
+		Filename:      filename,
+		MimeType:      mimeType,
+		DirectPath:    directPath,
+		MediaKey:      mediaKey,
+		FileSHA256:    fileSHA256,
+		FileEncSHA256: fileEncSHA256,
+		FileLength:    fileLength,
 	})
 
 	// Notify handlers
@@ -494,16 +518,41 @@ func (m *Manager) handleHistorySync(evt *events.HistorySync) {
 				chatName = a.WA().ResolveChatName(m.ctx, pm.Chat, pm.PushName)
 			}
 
+			var mediaType, caption string
+			var mediaKey, fileSHA256, fileEncSHA256 []byte
+			var directPath, mimeType, filename string
+			var fileLength uint64
+			if pm.Media != nil {
+				mediaType = pm.Media.Type
+				caption = pm.Media.Caption
+				filename = pm.Media.Filename
+				mimeType = pm.Media.MimeType
+				directPath = pm.Media.DirectPath
+				mediaKey = pm.Media.MediaKey
+				fileSHA256 = pm.Media.FileSHA256
+				fileEncSHA256 = pm.Media.FileEncSHA256
+				fileLength = pm.Media.FileLength
+			}
+
 			_ = a.DB().UpsertChat(pm.Chat.String(), chatKind(pm.Chat), chatName, pm.Timestamp)
 			_ = a.DB().UpsertMessage(store.UpsertMessageParams{
-				ChatJID:    pm.Chat.String(),
-				ChatName:   chatName,
-				MsgID:      pm.ID,
-				SenderJID:  pm.SenderJID,
-				SenderName: pm.PushName,
-				Timestamp:  pm.Timestamp,
-				FromMe:     pm.FromMe,
-				Text:       pm.Text,
+				ChatJID:       pm.Chat.String(),
+				ChatName:      chatName,
+				MsgID:         pm.ID,
+				SenderJID:     pm.SenderJID,
+				SenderName:    pm.PushName,
+				Timestamp:     pm.Timestamp,
+				FromMe:        pm.FromMe,
+				Text:          pm.Text,
+				MediaType:     mediaType,
+				MediaCaption:  caption,
+				Filename:      filename,
+				MimeType:      mimeType,
+				DirectPath:    directPath,
+				MediaKey:      mediaKey,
+				FileSHA256:    fileSHA256,
+				FileEncSHA256: fileEncSHA256,
+				FileLength:    fileLength,
 			})
 		}
 	}
